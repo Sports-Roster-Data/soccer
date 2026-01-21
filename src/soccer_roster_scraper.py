@@ -411,6 +411,19 @@ class URLBuilder:
                 # If season is already a range, use as-is
                 return f"{base_url}/roster/season/{season}/"
 
+        elif url_format == 'virginia_table':
+            # Virginia table view adds ?view=table
+            # Example: https://virginiasports.com/sports/msoc/roster/season/2025-26?view=table
+            # Convert single year to range (2025 -> 2025-26)
+            try:
+                year = int(season)
+                next_year = str(year + 1)[-2:]  # Get last 2 digits
+                season_range = f"{year}-{next_year}"
+                return f"{base_url}/roster/season/{season_range}?view=table"
+            except ValueError:
+                # If season is already a range, use as-is
+                return f"{base_url}/roster/season/{season}?view=table"
+
         elif url_format == 'clemson_roster':
             # Clemson uses /roster/season/{year}/ with just the year
             # Example: https://clemsontigers.com/sports/mens-soccer/roster/season/2025/
@@ -512,7 +525,7 @@ class TeamConfig:
         630: {'url_format': 'ucf_table', 'requires_js': True, 'notes': 'San Jose State - Custom URL + JS rendering'},
         674: {'url_format': 'ucf_table', 'requires_js': True, 'notes': 'Stanford - Custom URL + JS rendering'},
         742: {'url_format': 'ucf_table', 'requires_js': True, 'notes': 'Va Tech - Custom URL + JS rendering'},
-        746: {'url_format': 'virginia_season', 'requires_js': False, 'notes': 'Virginia - WMT Digital /roster/season/YYYY-YY/ format'},
+        746: {'url_format': 'virginia_table', 'requires_js': False, 'notes': 'Virginia - WMT Digital /roster/season/YYYY-YY/ format (table view)'},
         813: {'url_format': 'default', 'requires_js': False, 'notes': 'Yale - Standard Sidearm'},
         1000: {'url_format': 'msoc_season_range', 'requires_js': False, 'notes': 'Carson-Newman - /sports/m-soccer/YYYY-YY/roster format'},
         1356: {'url_format': 'ucf_table', 'requires_js': True, 'notes': 'Seattle - Custom URL + JS rendering'},
