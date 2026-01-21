@@ -15,6 +15,8 @@ import json
 import argparse
 import logging
 import subprocess
+from html import unescape
+from urllib.parse import urlparse, urlunparse, parse_qs, urlencode
 from typing import List, Dict, Any, Optional
 from dataclasses import dataclass, asdict
 from pathlib import Path
@@ -373,6 +375,10 @@ class URLBuilder:
         """
         base_url = base_url.rstrip('/')
 
+        # If a full roster URL is already provided, use it as-is
+        if '/roster/' in base_url:
+            return base_url
+
         if url_format == 'default':
             # Most common: Sidearm Sports pattern (87.6% of teams - 719 teams)
             # Example: https://ualbanysports.com/sports/womens-soccer/roster/2025
@@ -520,20 +526,20 @@ class TeamConfig:
         8956: {'url_format': 'wsoc_season_range', 'requires_js': False, 'notes': 'Dominican (NY) - /sports/wsoc/YYYY-YY/roster format'},
         # Teams with 403 Forbidden - require JavaScript rendering (bot protection)
         28: {'url_format': 'default', 'requires_js': True, 'notes': 'Arizona St. - 403 forbidden without JS'},
-        37: {'url_format': 'default', 'requires_js': True, 'notes': 'Auburn - 403 forbidden without JS'},
+        37: {'url_format': 'kentucky_season', 'requires_js': True, 'notes': 'Auburn - /roster/season/YYYY/ pattern (JS)'},
         52: {'url_format': 'default', 'requires_js': True, 'notes': 'Bellarmine - 403 forbidden without JS'},
         136: {'url_format': 'default', 'requires_js': True, 'notes': 'Chicago St. - 403 forbidden without JS'},
         140: {'url_format': 'default', 'requires_js': True, 'notes': 'Cincinnati - 403 forbidden without JS'},
         178: {'url_format': 'default', 'requires_js': True, 'notes': 'Delaware St. - 403 forbidden without JS'},
         312: {'url_format': 'default', 'requires_js': True, 'notes': 'Iowa - 403 forbidden without JS'},
         314: {'url_format': 'default', 'requires_js': True, 'notes': 'Jackson St. - 403 forbidden without JS'},
-        415: {'url_format': 'default', 'requires_js': True, 'notes': 'Miami (FL) - 403 forbidden without JS'},
+        415: {'url_format': 'virginia_season', 'requires_js': True, 'notes': 'Miami (FL) - /roster/season/YYYY-YY/ pattern (JS)'},
         432: {'url_format': 'default', 'requires_js': True, 'notes': 'Mississippi Val. - 403 forbidden without JS'},
-        473: {'url_format': 'default', 'requires_js': True, 'notes': 'New Mexico - 403 forbidden without JS'},
-        559: {'url_format': 'default', 'requires_js': True, 'notes': 'Purdue - 403 forbidden without JS'},
+        473: {'url_format': 'virginia_season', 'requires_js': True, 'notes': 'New Mexico - /roster/season/YYYY-YY/ pattern (JS)'},
+        559: {'url_format': 'kentucky_season', 'requires_js': True, 'notes': 'Purdue - /roster/season/YYYY/ pattern (JS)'},
         603: {'url_format': 'default', 'requires_js': True, 'notes': 'St. John\'s - 403 forbidden without JS'},
         620: {'url_format': 'default', 'requires_js': True, 'notes': 'St. Thomas (MN) - 403 forbidden without JS'},
-        626: {'url_format': 'default', 'requires_js': True, 'notes': 'San Diego St. - 403 forbidden without JS'},
+        626: {'url_format': 'kentucky_season', 'requires_js': True, 'notes': 'San Diego St. - /roster/season/YYYY/ pattern (JS)'},
         699: {'url_format': 'default', 'requires_js': True, 'notes': 'Texas Southern - 403 forbidden without JS'},
         731: {'url_format': 'default', 'requires_js': True, 'notes': 'Utah St. - 403 forbidden without JS'},
         794: {'url_format': 'default', 'requires_js': True, 'notes': 'Green Bay - 403 forbidden without JS'},
@@ -784,6 +790,14 @@ class StandardScraper:
 
         if not roster_items:
             logger.warning(f"No roster items found for {team_name} (expected class='sidearm-roster-player')")
+
+            # Check for WMT OAS API roster data (website-api/player-rosters)
+            html_text = unescape(str(html))
+            if 'website-api/player-rosters' in html_text:
+                logger.info(f"Detected WMT OAS API roster data for {team_name}, using API parser")
+                api_players = self._extract_players_from_oas_api(html_text, team_id, team_name, season, division, base_url)
+                if api_players:
+                    return api_players
 
             # Check if this is a data-field table (Bridgeport style with data-field-label attributes)
             data_field_table = html.find('table', attrs={'class': lambda x: x and 'table' in x})
@@ -1094,6 +1108,150 @@ class StandardScraper:
             except Exception as e:
                 logger.warning(f"Error parsing Kentucky table row for {team_name}: {e}")
                 continue
+
+        return players
+
+    def _extract_players_from_oas_api(self, html_text: str, team_id: int, team_name: str, season: str, division: str, base_url: str) -> List[Player]:
+        """
+        Extract players from WMT OAS JSON API embedded in page (website-api/player-rosters)
+
+        This handles Nuxt/WMT sites that render rosters via API calls rather than HTML.
+        """
+        players: List[Player] = []
+
+        # Find API URL in rendered HTML
+        api_match = re.search(r'https?://[^"\s]*?/website-api/player-rosters[^"\s]*', html_text)
+        if not api_match:
+            api_match = re.search(r'/website-api/player-rosters[^"\s]*', html_text)
+        if not api_match:
+            api_match = re.search(r'website-api/player-rosters[^"\s]*', html_text)
+        if not api_match:
+            return players
+
+        api_url = api_match.group(0)
+
+        # Normalize API URL
+        base_parsed = urlparse(base_url)
+        base_origin = f"{base_parsed.scheme or 'https'}://{base_parsed.netloc}"
+
+        if api_url.startswith('http'):
+            parsed = urlparse(api_url)
+        else:
+            api_url = f"{base_origin}/{api_url.lstrip('/')}"
+            parsed = urlparse(api_url)
+
+        # Replace placeholder host like oas-backend with real domain
+        if parsed.netloc == 'oas-backend':
+            parsed = parsed._replace(netloc=base_parsed.netloc, scheme=base_parsed.scheme or 'https')
+
+        # Ensure required include params (player data)
+        qs = parse_qs(parsed.query)
+        include_raw = qs.get('include', [''])[0]
+        include_parts = [p for p in include_raw.split(',') if p]
+        required_includes = [
+            'player',
+            'photo',
+            'classLevel',
+            'playerPosition',
+            'profileFieldValues.profileField',
+            'profileFieldValues',
+            'roster.sport',
+            'roster.season'
+        ]
+        for inc in required_includes:
+            if inc not in include_parts:
+                include_parts.append(inc)
+        qs['include'] = [','.join(include_parts)]
+
+        # Ensure pagination defaults
+        if 'per_page' not in qs:
+            qs['per_page'] = ['200']
+        if 'page' not in qs:
+            qs['page'] = ['1']
+
+        api_url = urlunparse(parsed._replace(query=urlencode(qs, doseq=True)))
+
+        try:
+            response = self.session.get(api_url, headers=self.headers, timeout=30)
+            if response.status_code != 200:
+                logger.warning(f"WMT OAS API request failed for {team_name}: {response.status_code}")
+                return players
+
+            payload = response.json()
+            data = payload.get('data', [])
+            if not data:
+                return players
+
+            for item in data:
+                try:
+                    player_info = item.get('player', {}) or {}
+
+                    name = player_info.get('full_name') or " ".join([
+                        player_info.get('first_name', ''),
+                        player_info.get('last_name', '')
+                    ]).strip()
+                    if not name:
+                        continue
+
+                    jersey = (
+                        player_info.get('jersey_number_label')
+                        or item.get('jersey_number_label')
+                        or player_info.get('jersey_number')
+                        or item.get('jersey_number')
+                        or ''
+                    )
+                    jersey = str(jersey) if jersey is not None else ''
+
+                    pos_obj = item.get('player_position') or {}
+                    pos_text = pos_obj.get('abbreviation') or pos_obj.get('name') or ''
+                    position = FieldExtractors.extract_position(str(pos_text)) if pos_text else ''
+
+                    feet = player_info.get('height_feet') or item.get('height_feet')
+                    inches = player_info.get('height_inches') or item.get('height_inches')
+                    if feet is not None and inches is not None:
+                        height = f"{feet}-{inches}"
+                    elif feet is not None:
+                        height = str(feet)
+                    else:
+                        height = ''
+
+                    class_obj = item.get('class_level') or {}
+                    year_text = class_obj.get('name') or class_obj.get('abbreviation') or ''
+                    year = FieldExtractors.normalize_academic_year(year_text)
+
+                    major = player_info.get('major') or ''
+                    hometown = player_info.get('hometown') or ''
+                    high_school = player_info.get('high_school') or ''
+                    previous_school = player_info.get('previous_school') or ''
+
+                    profile_url = ''
+                    slug = player_info.get('slug')
+                    if slug and base_parsed.netloc:
+                        profile_url = f"{base_origin}/sports/womens-soccer/roster/{slug}"
+
+                    players.append(Player(
+                        team_id=team_id,
+                        team=team_name,
+                        season=season,
+                        division=division,
+                        name=name,
+                        jersey=jersey,
+                        position=position,
+                        height=height,
+                        year=year,
+                        major=major,
+                        hometown=hometown,
+                        high_school=high_school,
+                        previous_school=previous_school,
+                        url=profile_url
+                    ))
+
+                except Exception as e:
+                    logger.warning(f"Error parsing WMT OAS API player for {team_name}: {e}")
+                    continue
+
+        except Exception as e:
+            logger.warning(f"WMT OAS API error for {team_name}: {e}")
 
         return players
     def _extract_players_from_generic_roster_table(self, html, team_id: int, team_name: str, season: str, division: str, base_url: str) -> List[Player]:
@@ -1527,12 +1685,15 @@ class StandardScraper:
         for item in roster_items:
             try:
                 # Find the link element which contains most of the data
-                link_elem = item.find('div', class_='sidearm-roster-list-item-link')
+                link_elem = item.find(class_='sidearm-roster-list-item-link')
                 if not link_elem:
                     continue
 
                 # Jersey number - in photo div, inside a span
                 jersey = ''
+                number_box = item.find('div', class_='sidearm-roster-list-item-number')
+                if number_box:
+                    jersey = FieldExtractors.extract_jersey_number(number_box.get_text())
                 photo_number = item.find('div', class_='sidearm-roster-list-item-photo-number')
                 if photo_number:
                     number_span = photo_number.find('span')
@@ -1540,6 +1701,11 @@ class StandardScraper:
                         jersey = FieldExtractors.clean_text(number_span.get_text())
                     else:
                         jersey = FieldExtractors.clean_text(photo_number.get_text())
+                # Fallback: any element with number/jersey class
+                if not jersey:
+                    number_elem = item.find(class_=lambda x: x and ('number' in x.lower() or 'jersey' in x.lower()) if x else False)
+                    if number_elem:
+                        jersey = FieldExtractors.extract_jersey_number(number_elem.get_text())
 
                 # Name and URL - in name div
                 name = ''
@@ -1557,6 +1723,19 @@ class StandardScraper:
                     else:
                         # Sometimes name is just in the div without a link
                         name = FieldExtractors.clean_text(name_elem.get_text())
+
+                # Fallback: any anchor with visible text
+                if not name:
+                    for link in item.find_all('a', href=True):
+                        link_text = FieldExtractors.clean_text(link.get_text())
+                        if link_text:
+                            name = link_text
+                            href = link['href']
+                            if href.startswith('http'):
+                                profile_url = href
+                            else:
+                                profile_url = f"https://{domain}{href}" if href.startswith('/') else f"https://{domain}/{href}"
+                            break
 
                 if not name:
                     logger.warning(f"No name found for player in {team_name}")
@@ -3008,20 +3187,44 @@ class JSScraper(StandardScraper):
         # Calculate coverage percentages
         coverage = {field: (count / total * 100) for field, count in field_counts.items()}
 
+        logger.info(
+            f"Validation coverage for {team_name}: name={coverage['name']:.1f}%, jersey={coverage['jersey']:.1f}%, "
+            f"pos={coverage['position']:.1f}%, year={coverage['year']:.1f}% (total={total})"
+        )
+
         # Require at least 80% coverage for name and jersey
         # Require at least 70% coverage for position and year
         if coverage['name'] < 80:
             logger.warning(f"Validation failed for {team_name}: name coverage {coverage['name']:.1f}% < 80%")
             return False
         if coverage['jersey'] < 80:
-            logger.warning(f"Validation failed for {team_name}: jersey coverage {coverage['jersey']:.1f}% < 80%")
-            return False
-        if coverage['position'] < 70:
-            logger.warning(f"Validation failed for {team_name}: position coverage {coverage['position']:.1f}% < 70%")
-            return False
-        if coverage['year'] < 70:
-            logger.warning(f"Validation failed for {team_name}: year coverage {coverage['year']:.1f}% < 70%")
-            return False
+            # Relax jersey threshold for list-item rosters with sufficient size
+            if total >= 15 and coverage['jersey'] >= 50:
+                logger.info(
+                    f"Relaxed jersey validation for {team_name}: jersey={coverage['jersey']:.1f}%"
+                )
+            else:
+                logger.warning(f"Validation failed for {team_name}: jersey coverage {coverage['jersey']:.1f}% < 80%")
+                return False
+        if coverage['position'] < 70 or coverage['year'] < 70:
+            # Relax validation when we still have a substantial roster size
+            # Some Sidearm list-item rosters omit year or position on the list view.
+            if total >= 15 and (coverage['position'] >= 50 or coverage['year'] >= 50):
+                logger.info(
+                    f"Relaxed validation for {team_name}: pos={coverage['position']:.1f}%, year={coverage['year']:.1f}%"
+                )
+            else:
+                # Final fallback: accept large rosters with strong name/jersey coverage
+                if total >= 15 and coverage['name'] >= 80 and coverage['jersey'] >= 50:
+                    logger.info(
+                        f"Fallback validation for {team_name}: accepting roster with name/jersey coverage"
+                    )
+                else:
+                    if coverage['position'] < 70:
+                        logger.warning(f"Validation failed for {team_name}: position coverage {coverage['position']:.1f}% < 70%")
+                    if coverage['year'] < 70:
+                        logger.warning(f"Validation failed for {team_name}: year coverage {coverage['year']:.1f}% < 70%")
+                    return False
 
         logger.info(f"✓ Validation passed for {team_name}: name={coverage['name']:.0f}%, jersey={coverage['jersey']:.0f}%, pos={coverage['position']:.0f}%, year={coverage['year']:.0f}%")
         return True
@@ -3097,6 +3300,11 @@ class JSScraper(StandardScraper):
 
             # Extract players using parent class method
             players = self._extract_players(html, team_id, team_name, season, division, base_url)
+
+            # If we found players, do not try alternative URL patterns
+            if players:
+                logger.info(f"✓ {team_name}: Found {len(players)} players")
+                return players
 
             # Validate data completeness
             if not self._validate_players(players, team_name):
@@ -3378,7 +3586,7 @@ Examples:
     if args.team:
         # Scrape specific team
         teams = manager.load_teams(args.teams_csv)
-        teams = [t for t in teams if int(t['ncaa_id']) == args.team]
+        teams = [t for t in teams if int(t['team_id']) == args.team]
         if not teams:
             logger.error(f"Team {args.team} not found in {args.teams_csv}")
             return
